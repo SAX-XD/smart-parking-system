@@ -1,5 +1,5 @@
-streamlit==1.32.0
-opencv-python==4.9.0.80
-ultralytics==8.1.0
-numpy==1.26.4
-scikit-image==0.22.0
+streamlit
+opencv-python
+ultralytics
+numpy
+scikit-image
