@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['car', 'parking-space']
+
+roboflow:
+  workspace: arfan-anwar
+  project: parking-space-3-dzsue
+  version: dataset
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/arfan-anwar/parking-space-3-dzsue/dataset/dataset

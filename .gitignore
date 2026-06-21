@@ -1,3 +1,22 @@
+
+# =====================================================================
+# Smart Parking System - Custom Model & Testing Rules
+# =====================================================================
+
+# Ignore AI model checkpoint weight files (Too massive for GitHub)
+*.pt
+*.pth
+*.onnx
+models/
+runs/
+
+# Ignore local visual verification artifacts and data snapshots
+test_result.jpg
+*.jpg
+*.jpeg
+*.png
+!data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
