@@ -1,93 +1,174 @@
+import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
-# Import Taha's optimized image processing and rendering functions
-from utils import enhance_frame, draw_parking_bays, count_available_slots
+
+from utils import (
+    enhance_frame,
+    resize_keep_aspect,
+    draw_parking_bays,
+    extract_detections_by_class,
+    auto_confidence_threshold,
+    polygon_to_xyxy,
+    box_to_polygon,
+    deduplicate_boxes,
+)
+
+# Class indices inside the custom-trained segmentation model (models/best.pt),
+# confirmed from the checkpoint's own metadata: {0: 'car', 1: 'parking-space'}.
+#
+# Tested against real sample footage: the 'parking-space' class only ever
+# fires on bays with NO car on them (visibly empty ground/markings). There is
+# no separate "occupied bay" outline in this dataset -- a car detection IS
+# the occupied signal. So:
+#     occupied_spaces = number of vehicles detected (deduplicated across both models)
+#     free_spaces     = number of 'parking-space' detections from the custom model
+#     total_spaces    = occupied_spaces + free_spaces
+CAR_CLASS = 0
+EMPTY_SPACE_CLASS = 1
+
+# COCO class indices used from the generic yolov8n.pt vehicle detector.
+COCO_VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+
+# Very low floor passed to the models themselves, just to pull in every
+# candidate detection (real + noise) so the auto-thresholding below has
+# enough data points to find a genuine split between the two.
+DETECTION_FLOOR_CONF = 0.01
+
+# Safety floors for the auto-picked threshold -- not "the" threshold, just a
+# backstop for when there's too little data to find a real split (e.g. a
+# single detection) so obvious noise still can't sneak through.
+VEHICLE_MIN_FLOOR = 0.25
+EMPTY_SPACE_MIN_FLOOR = 0.05
+
 
 class ParkingPipeline:
-    def __init__(self, custom_model_path="models/best.pt"):
-        """
-        Initializes the object detection and instance segmentation models.
-        Default custom model path looks inside the project's models/ folder.
-        """
-        # Model 1: Pre-trained out-of-the-box vehicle detector
-        self.vehicle_model = YOLO('models/yolov8n.pt') 
-        
-        # Model 2: Custom fine-tuned instance segmentation model (from Member 3)
-        if custom_model_path:
-            self.custom_space_model = YOLO(custom_model_path)
-        else:
-            self.custom_space_model = None
+    """
+    Two-model parking-occupancy pipeline with self-tuning confidence.
 
-    def process_frame(self, frame):
-        """
-        Main entry point that the Streamlit UI framework calls inside its processing loop.
-        Takes a raw OpenCV BGR frame, processes it, and returns (annotated_frame, available_slots).
-        """
-        # 1. Image Enhancement (CLAHE Optimization via utils)
-        enhanced_frame = enhance_frame(frame) 
-        
-        # 2. Vehicle Detection (Model 1)
-        # Filters for Cars (2), Motorbikes (3), Buses (5), and Trucks (7)
-        vehicle_results = self.vehicle_model(enhanced_frame, classes=[2, 3, 5, 7], verbose=False)
-        
-        # Extract vehicle bounding boxes [[x1, y1, x2, y2], ...]
-        vehicle_boxes = []
-        if len(vehicle_results) > 0 and len(vehicle_results[0].boxes) > 0:
-            vehicle_boxes = vehicle_results[0].boxes.xyxy.cpu().numpy()
-        
-        # 3. Dynamic Space Tracking Logic via Instance Segmentation (Model 2)
-        detected_spaces = []
-        if self.custom_space_model is not None:
-            # Run inference using the custom model to extract parking slot masks
-            space_results = self.custom_space_model(enhanced_frame, verbose=False)
-            
-            # Check if any segmentation masks were successfully parsed
-            if len(space_results) > 0 and space_results[0].masks is not None:
-                # .xy extracts the raw multi-point polygon coordinates
-                detected_spaces = [poly.astype(np.int32) for poly in space_results[0].masks.xy]
-        
-        # Fallback to standard mock spaces if the model does not return layout shapes
-        if len(detected_spaces) == 0:
-            detected_spaces = [np.array(poly, np.int32) for poly in [
-                [[50, 300], [200, 300], [200, 450], [50, 450]],
-                [[250, 300], [400, 300], [400, 450], [250, 450]],
-                [[450, 300], [600, 300], [600, 450], [450, 450]]
-            ]]
-        
-        # 4. Calculate Spatial Occupancy Matrix Status using vector geometry math
-        occupancy_states = self.check_occupancy(vehicle_boxes, detected_spaces)
-        
-        # 5. Render Translucent Visual Overlays (Alpha-Blending via utils)
-        annotated_frame = draw_parking_bays(enhanced_frame, detected_spaces, occupancy_states)
-        
-        # 6. Sum up final availability metrics
-        available_count = count_available_slots(occupancy_states)
-        
-        return annotated_frame, available_count
+    Model 1 (custom, best.pt): segmentation model trained on this parking lot.
+        - class 'car'           -> a parked vehicle (occupies one bay)
+        - class 'parking-space' -> a bay with nothing parked on it
+    Model 2 (generic, yolov8n.pt): pretrained COCO detector, used as a second,
+        independent opinion on where the vehicles are.
 
-    def check_occupancy(self, vehicle_boxes, space_polygons):
+    Rather than a fixed confidence cutoff, every class's detections are
+    pulled in down to a near-zero floor, then split into "real" vs "noise"
+    using Otsu's method on the confidence values themselves (see
+    `utils.auto_confidence_threshold`). This adapts per image/frame instead
+    of needing a slider tuned per parking lot or lighting condition.
+    """
+
+    def __init__(
+        self,
+        vehicle_model_path: str = "models/yolov8n.pt",
+        space_model_path: str = "models/best.pt",
+        max_width: int = None,
+        enhance_contrast: bool = False,
+    ):
+        for path, label in ((vehicle_model_path, "vehicle"), (space_model_path, "parking-space")):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Could not find the {label} model at '{path}'. "
+                    f"Check that the file exists relative to your working directory."
+                )
+
+        self.vehicle_model = YOLO(vehicle_model_path)
+        self.space_model = YOLO(space_model_path)
+
+        self.max_width = max_width
+        # Off by default: testing against real footage showed CLAHE contrast
+        # enhancement (designed for poor-lighting webcam input) actually
+        # *lowers* the custom model's confidence on well-lit frames, since it
+        # was trained on raw, unenhanced images. Turn on only for genuinely
+        # dark/low-contrast footage.
+        self.enhance_contrast = enhance_contrast
+
+        # Last thresholds the algorithm picked, exposed purely for debugging/
+        # display -- nothing reads these back into detection logic.
+        self.last_thresholds = {"vehicle": None, "empty_space": None}
+
+    # ------------------------------------------------------------------ #
+    # Public controls (wired up to the Streamlit sidebar)
+    # ------------------------------------------------------------------ #
+
+    def configure(self, max_width=None, enhance_contrast=None):
+        """Cheap to call every rerun -- only updates plain attributes, never reloads models."""
+        if max_width is not None:
+            self.max_width = max_width
+        if enhance_contrast is not None:
+            self.enhance_contrast = enhance_contrast
+
+    def reset_memory(self):
         """
-        Evaluates whether a detected vehicle's center pixel point drops inside a space polygon.
+        Kept for backward compatibility with the UI's Reset button. The
+        pipeline no longer carries any state between frames -- every frame
+        is analysed independently -- so there's nothing to actually clear.
         """
-        states = []
-        for polygon in space_polygons:
-            space_occupied = False
-            poly_array = np.array(polygon, dtype=np.int32)
-            
-            for box in vehicle_boxes:
-                x1, y1, x2, y2 = map(int, box)
-                # Compute the midpoints of the vehicle's bounding envelope
-                center_x = int((x1 + x2) / 2)
-                center_y = int((y1 + y2) / 2)
-                
-                # Run the compiled OpenCV contour point-containment test
-                is_inside = cv2.pointPolygonTest(poly_array, (center_x, center_y), False)
-                
-                # A score >= 0 indicates the point is safely inside or on the perimeter
-                if is_inside >= 0:
-                    space_occupied = True
-                    break
-                    
-            states.append(space_occupied)
-        return states
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Main entry point
+    # ------------------------------------------------------------------ #
+
+    def process_frame(self, frame: np.ndarray):
+        if frame is None or frame.size == 0:
+            return frame, {"total_spaces": 0, "occupied_spaces": 0, "free_spaces": 0, "total_vehicles": 0}
+
+        if self.max_width:
+            frame = resize_keep_aspect(frame, self.max_width)
+
+        enhanced_frame = enhance_frame(frame) if self.enhance_contrast else frame
+
+        # --- Custom model: cast a wide net, then auto-split each class -----
+        space_results = self.space_model(enhanced_frame, conf=DETECTION_FLOOR_CONF, verbose=False)[0]
+        by_class = extract_detections_by_class(space_results)
+
+        car_candidates = by_class.get(CAR_CLASS, [])
+        empty_candidates = by_class.get(EMPTY_SPACE_CLASS, [])
+
+        car_cutoff = auto_confidence_threshold([c for _, c in car_candidates], min_floor=VEHICLE_MIN_FLOOR)
+        empty_cutoff = auto_confidence_threshold([c for _, c in empty_candidates], min_floor=EMPTY_SPACE_MIN_FLOOR)
+
+        custom_car_polygons = [poly for poly, conf in car_candidates if conf >= car_cutoff]
+        empty_space_polygons = [poly for poly, conf in empty_candidates if conf >= empty_cutoff]
+
+        # --- Generic COCO model: same wide-net-then-split treatment --------
+        vehicle_results = self.vehicle_model(
+            enhanced_frame, classes=COCO_VEHICLE_CLASSES, conf=DETECTION_FLOOR_CONF, verbose=False
+        )[0]
+        coco_boxes, coco_confs = [], []
+        if vehicle_results.boxes is not None and len(vehicle_results.boxes) > 0:
+            coco_boxes = [tuple(map(int, b)) for b in vehicle_results.boxes.xyxy.cpu().numpy()]
+            coco_confs = vehicle_results.boxes.conf.cpu().numpy().tolist()
+
+        coco_cutoff = auto_confidence_threshold(coco_confs, min_floor=VEHICLE_MIN_FLOOR)
+        coco_vehicle_boxes = [b for b, c in zip(coco_boxes, coco_confs) if c >= coco_cutoff]
+
+        self.last_thresholds = {"vehicle": round(max(car_cutoff, coco_cutoff), 3), "empty_space": round(empty_cutoff, 3)}
+
+        # --- Combine + de-duplicate vehicles seen by either model ----------
+        custom_car_boxes = [polygon_to_xyxy(p) for p in custom_car_polygons]
+        vehicle_boxes = deduplicate_boxes([custom_car_boxes, coco_vehicle_boxes], iou_threshold=0.5)
+
+        occupied_spaces = len(vehicle_boxes)
+        free_spaces = len(empty_space_polygons)
+        total_spaces = occupied_spaces + free_spaces
+
+        # Draw both signals on one overlay: vehicles -> "occupied" (red),
+        # detected empty ground -> "free" (green).
+        all_polygons = [box_to_polygon(b) for b in vehicle_boxes] + list(empty_space_polygons)
+        occupancy_states = [True] * occupied_spaces + [False] * free_spaces
+
+        annotated_frame = (
+            draw_parking_bays(frame, all_polygons, occupancy_states)
+            if total_spaces > 0 else frame.copy()
+        )
+
+        info = {
+            "total_spaces": total_spaces,
+            "occupied_spaces": occupied_spaces,
+            "free_spaces": free_spaces,
+            "total_vehicles": occupied_spaces,
+        }
+        return annotated_frame, info
