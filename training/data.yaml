@@ -3,11 +3,11 @@ val: ../valid/images
 test: ../test/images
 
 nc: 2
-names: ['car', 'parking-space']
+names: ['car', 'free']
 
 roboflow:
-  workspace: arfan-anwar
-  project: parking-space-3-dzsue
-  version: dataset
+  workspace: ai-g2sr1
+  project: parking-space-uqgmz
+  version: 1
   license: CC BY 4.0
-  url: https://universe.roboflow.com/arfan-anwar/parking-space-3-dzsue/dataset/dataset
+  url: https://universe.roboflow.com/ai-g2sr1/parking-space-uqgmz/dataset/1
