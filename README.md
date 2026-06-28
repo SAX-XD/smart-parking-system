@@ -18,7 +18,7 @@ This project implements a comprehensive suite of foundational and modern Compute
 
 * **Video Processing & Dynamic Inference:** Decodes sequential temporal video arrays while orchestrating a highly optimized frame-skipping interval strategy (calculating AI logic strictly every 2 seconds) to boost throughput efficiency.
 
-* **State Tracking (Caching Architecture):** Utilizes a low-latency structural state-caching matrix to maintain and carry forward spatial metrics on non-inference frames, completely eliminating rendering stutter.
+* **State Tracking (Caching Architecture):** Utilizes a low-latency structural state-caching matrix to maintain and carry forward spatial metrics on non-inference frames, completely eliminating rendering stutter. 
 
 ---
 
@@ -77,3 +77,5 @@ Enhance Contrast Checkbox: Toggles the localized CLAHE matrix to clarify dark or
 Show Edge Detection Overlay Checkbox: Toggles live Canny edge maps and morphological dilations blended seamlessly onto the output feed at 30% opacity.
 
 Interactive Controls: Use the responsive Play, Pause, and Restart buttons to evaluate deep metric properties frame-by-frame.
+
+YOU CAN USE THE IMAGES/VIDEO IN THE TEST_IMAGES_VIDEOS FOR TESTING THE APP :) ;)
