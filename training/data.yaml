@@ -6,8 +6,8 @@ nc: 2
 names: ['car', 'free']
 
 roboflow:
-  workspace: ai-g2sr1
-  project: parking-space-uqgmz
+  workspace: amal-saeed
+  project: parking-space-updater-2
   version: 1
   license: CC BY 4.0
-  url: https://universe.roboflow.com/ai-g2sr1/parking-space-uqgmz/dataset/1
+  url: https://universe.roboflow.com/amal-saeed/parking-space-updater-2/dataset/1
